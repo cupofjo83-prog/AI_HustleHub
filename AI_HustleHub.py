@@ -1,16 +1,20 @@
 # AI_HustleHub.py
-# Modular 3-column Streamlit dashboard with function independence,
-# batch/individual execution, API usage counter, and ethical scraper.
+# Modular per-function Streamlit dashboard with function independence,
+# per-tool inputs/outputs, API usage counter, and ethical scraper.
 # Author: RuralJoe + GPT-5 Thinking
 
 import os
 import time
 import traceback
+import io
+
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 
 import streamlit as st
+from dotenv import load_dotenv
+import google.generativeai as genai
 
 # =========================
 # ===== CONFIG / SETUP =====
@@ -22,17 +26,23 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ---- Gemini client (optional) ----
-# Best practice: put your key in an env var: export GEMINI_API_KEY="..."
-# or add it to .streamlit/secrets.toml as GEMINI_API_KEY="..."
-try:
-    from google import genai
-    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY", None)
-    MODEL_NAME = "gemini-2.5-flash"
-    _gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
-except Exception:
-    _gemini_client = None
-    MODEL_NAME = "gemini-2.5-flash"
+# ---- Env + Gemini client ----
+load_dotenv()
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY", None)
+MODEL_NAME = "gemini-2.5-flash"  # adjust if needed
+
+_gemini_client = None
+if GEMINI_API_KEY:
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+        _gemini_client = genai.GenerativeModel(MODEL_NAME)
+        print("[OK] Gemini client initialized")
+    except Exception as e:
+        print(f"[ERROR] Failed to initialize Gemini client: {e}")
+        _gemini_client = None
+else:
+    print("[WARN] GEMINI_API_KEY is not set; Gemini tools will be unavailable.")
 
 def gemini_available() -> bool:
     return _gemini_client is not None
@@ -53,7 +63,7 @@ def call_gemini(prompt: str) -> str:
     if not gemini_available():
         return "ERROR: Gemini client not initialized. Set GEMINI_API_KEY."
     try:
-        resp = _gemini_client.models.generate_content(model=MODEL_NAME, contents=prompt)
+        resp = _gemini_client.generate_content(prompt)
         text = (resp.text or "").strip()
         _count_api_call(True)
         return text if text else "ERROR: Empty response from model."
@@ -84,6 +94,30 @@ def save_topic_to_file(topic: str):
 
 def df_has_columns(df: pd.DataFrame, cols: list[str]) -> bool:
     return all(c in df.columns for c in cols)
+
+def save_text_download_button(label: str, text: str, filename: str):
+    """Offer a download button for text output."""
+    if not text:
+        return
+    buf = io.BytesIO(text.encode("utf-8"))
+    st.download_button(
+        label,
+        data=buf,
+        file_name=filename,
+        mime="text/plain",
+    )
+
+def save_csv_download_button(label: str, df: pd.DataFrame, filename: str):
+    """Offer a download button for CSV output."""
+    if df is None or df.empty:
+        return
+    buf = io.BytesIO(df.to_csv(index=False).encode("utf-8"))
+    st.download_button(
+        label,
+        data=buf,
+        file_name=filename,
+        mime="text/csv",
+    )
 
 # =========================
 # ===== CORE FUNCTIONS =====
@@ -292,7 +326,7 @@ def fn_scraper(url: str, acknowledge: bool) -> dict | str:
     }
 
 # =========================
-# ======= UI LAYOUT =======
+# ========= UI =============
 # =========================
 
 # Sidebar: session info + API counter
@@ -307,205 +341,230 @@ with st.sidebar:
     st.markdown("### 📟 API Usage")
     st.metric("Successful API Calls (this session)", st.session_state.api_calls)
     st.caption("Counts only successful model responses.")
-
-st.title("🧰 AI HustleHub — Modular Suite")
-
-# ---- Three columns (1:1:3) ----
-col1, col2, col3 = st.columns([1, 1, 3], vertical_alignment="top")
-
-# ================================
-# Column 1: Universal Input Panel
-# ================================
-with col1:
-    st.subheader("🔧 Universal Inputs")
-
-    WEBSITE = st.text_input(":WEBSITE (URL to Scrape)", placeholder="https://example.com/trends")
-    TOPIC = st.text_input(":TOPIC (Primary Niche)", placeholder="e.g., 'AI-powered Etsy listing optimizer'")
-    CPD = st.text_area(":CPD (Current Product Description)", height=120, placeholder="Paste existing product description (optional)")
-    BUSINESS_NAME = st.text_input(":BUSINESS NAME (for Leads)", placeholder="e.g., 'Acme Outdoors'")
-
     st.markdown("---")
-    st.caption("If :TOPIC is blank, functions will try to read 'hustle_topic.txt' automatically.")
+    st.caption("Each tool below has its own input {block} → output {block} on the main page.")
 
-    st.markdown("**CSV Inputs (optional)**")
-    up_products = st.file_uploader("input.csv (Products)", type=["csv"], key="upload_products")
-    up_leads = st.file_uploader("leads.csv (Leads)", type=["csv"], key="upload_leads")
+st.title("🧰 AI HustleHub — Per-Tool Panels")
 
-    df_products = pd.read_csv(up_products) if up_products is not None else None
-    df_leads = pd.read_csv(up_leads) if up_leads is not None else None
+# For visual “{ input } → { output }” mapping, each tool gets a container
+# with two columns: LEFT = input {block}, RIGHT = output {block}
 
-    st.markdown("---")
-    # Topic save/load helpers
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("💾 Save :TOPIC to hustle_topic.txt"):
-            if TOPIC:
-                save_topic_to_file(TOPIC)
-                st.success("Saved.")
-            else:
-                st.warning("Enter a :TOPIC first.")
-    with c2:
-        if st.button("📂 Load Topic from File"):
-            t = load_topic_from_file()
-            if t:
-                st.info(f"Loaded: **{t}**")
-            else:
-                st.warning("No topic file found.")
+st.markdown("### 1) Niche / Topic Generator { Input → Output }")
+with st.container():
+    in_col, out_col = st.columns([1, 1.2], vertical_alignment="top")
+    with in_col:
+        st.markdown("**{ Input } Niche / Topic**")
+        topic_input_1 = st.text_input(
+            "Topic / Niche (optional)",
+            key="topic_gen_input",
+            placeholder="Leave blank to auto-generate a niche"
+        )
+        if st.button("💡 Generate Niche / Topic", key="btn_topic_gen"):
+            out = fn_topic_generator(topic_input_1 if topic_input_1 else None)
+            st.session_state.outputs["topic"] = out
+            st.success("Generated niche/topic.")
 
-# ================================================
-# Column 2: Function Selection & Execution Panel
-# ================================================
-with col2:
-    st.subheader("🧩 Select & Run Tools")
+            # Auto-save if it's not an error
+            if isinstance(out, str) and out and not out.startswith("ERROR"):
+                save_topic_to_file(out)
 
-    # --- 1) Niche / Topic Generator ---
-    cb_topic = st.checkbox("1) Niche / Topic Generator")
-    if st.button("💡 Generate Niche / Topic"):
-        out = fn_topic_generator(TOPIC if TOPIC else None)
-        st.session_state.outputs["topic"] = out
+    with out_col:
+        st.markdown("**{ Output } Niche / Topic**")
+        t_out = st.session_state.outputs.get("topic")
+        if t_out:
+            st.code(t_out)
+            save_text_download_button("💾 Download Topic as .txt", t_out, "topic.txt")
+        else:
+            st.info("Run the generator to see output here.")
 
-    st.markdown("---")
+st.markdown("---")
 
-    # --- 2) Long Form ---
-    cb_long = st.checkbox("2) Ghostwriter — Long Form")
-    if st.button("📝 Generate Long-Form Outline"):
-        out = fn_long_form(TOPIC if TOPIC else None)
-        st.session_state.outputs["long_form"] = out
+st.markdown("### 2) Ghostwriter — Long Form { Input → Output }")
+with st.container():
+    in_col, out_col = st.columns([1, 1.2], vertical_alignment="top")
+    with in_col:
+        st.markdown("**{ Input } Long-Form**")
+        topic_input_long = st.text_input(
+            "Topic / Niche",
+            key="topic_long_input",
+            placeholder="If blank, will try hustle_topic.txt"
+        )
+        if st.button("📝 Generate Long-Form Outline", key="btn_long_form"):
+            out = fn_long_form(topic_input_long if topic_input_long else None)
+            st.session_state.outputs["long_form"] = out
+            st.success("Generated long-form outline.")
 
-    st.markdown("---")
+    with out_col:
+        st.markdown("**{ Output } Long-Form**")
+        long_out = st.session_state.outputs.get("long_form")
+        if long_out:
+            st.code(long_out)
+            save_text_download_button("💾 Download Long-Form as .txt", long_out, "long_form.txt")
+        else:
+            st.info("Run the long-form tool to see output here.")
 
-    # --- 3) Short Form ---
-    cb_short = st.checkbox("3) Ghostwriter — Short Form")
-    if st.button("🎬 Generate Short-Form Script Prep"):
-        out = fn_short_form(TOPIC if TOPIC else None)
-        st.session_state.outputs["short_form"] = out
+st.markdown("---")
 
-    st.markdown("---")
+st.markdown("### 3) Ghostwriter — Short Form { Input → Output }")
+with st.container():
+    in_col, out_col = st.columns([1, 1.2], vertical_alignment="top")
+    with in_col:
+        st.markdown("**{ Input } Short-Form**")
+        topic_input_short = st.text_input(
+            "Topic / Niche",
+            key="topic_short_input",
+            placeholder="If blank, will try hustle_topic.txt"
+        )
+        if st.button("🎬 Generate Short-Form Prep", key="btn_short_form"):
+            out = fn_short_form(topic_input_short if topic_input_short else None)
+            st.session_state.outputs["short_form"] = out
+            st.success("Generated short-form prep.")
 
-    # --- 4) Captions ---
-    cb_caps = st.checkbox("4) Social Media Captions")
-    if st.button("📸 Generate Captions"):
-        out = fn_captions(TOPIC if TOPIC else None)
-        st.session_state.outputs["captions"] = out
+    with out_col:
+        st.markdown("**{ Output } Short-Form**")
+        short_out = st.session_state.outputs.get("short_form")
+        if short_out:
+            st.code(short_out)
+            save_text_download_button("💾 Download Short-Form as .txt", short_out, "short_form.txt")
+        else:
+            st.info("Run the short-form tool to see output here.")
 
-    st.markdown("---")
+st.markdown("---")
 
-    # --- 5) Product Automator ---
-    cb_prod = st.checkbox("5) SEO Product Automator")
-    if st.button("🛒 Generate Product Descriptions"):
-        out = fn_product_automator(CPD if CPD else None, df_products)
-        st.session_state.outputs["products"] = out
+st.markdown("### 4) Social Media Captions { Input → Output }")
+with st.container():
+    in_col, out_col = st.columns([1, 1.2], vertical_alignment="top")
+    with in_col:
+        st.markdown("**{ Input } Captions**")
+        topic_input_caps = st.text_input(
+            "Topic / Niche",
+            key="topic_caps_input",
+            placeholder="If blank, will try hustle_topic.txt"
+        )
+        if st.button("📸 Generate Captions", key="btn_caps"):
+            out = fn_captions(topic_input_caps if topic_input_caps else None)
+            st.session_state.outputs["captions"] = out
+            st.success("Generated captions.")
 
-    st.markdown("---")
+    with out_col:
+        st.markdown("**{ Output } Captions**")
+        caps_out = st.session_state.outputs.get("captions")
+        if caps_out:
+            st.code(caps_out)
+            save_text_download_button("💾 Download Captions as .txt", caps_out, "captions.txt")
+        else:
+            st.info("Run the captions tool to see output here.")
 
-    # --- 6) Lead Processor ---
-    cb_leads = st.checkbox("6) Lead Processor / Outreach")
-    if st.button("📧 Generate Outreach Emails"):
-        out = fn_leads_processor(BUSINESS_NAME if BUSINESS_NAME else None, df_leads)
-        st.session_state.outputs["leads"] = out
+st.markdown("---")
 
-    st.markdown("---")
+st.markdown("### 5) SEO Product Automator { Input → Output }")
+with st.container():
+    in_col, out_col = st.columns([1, 1.2], vertical_alignment="top")
+    with in_col:
+        st.markdown("**{ Input } Products CSV + CPD**")
+        cpd_input = st.text_area(
+            "Current Product Description (optional)",
+            key="cpd_input",
+            height=120,
+            placeholder="Paste existing product description (optional)"
+        )
+        up_products = st.file_uploader(
+            "Upload input.csv (Products)",
+            type=["csv"],
+            key="upload_products_per_tool"
+        )
+        df_products = pd.read_csv(up_products) if up_products is not None else None
 
-    # --- 7) Ethical Scraper ---
-    cb_scrape = st.checkbox("7) Ethical Scraper / Data Collector")
-    st.warning("Before scraping: **You are responsible** for checking robots.txt and site Terms.")
-    ack_scrape = st.checkbox("I understand and agree to check robots.txt and Terms.", value=False)
+        if st.button("🛒 Generate Product Descriptions", key="btn_products"):
+            out = fn_product_automator(cpd_input if cpd_input else None, df_products)
+            st.session_state.outputs["products"] = out
+            st.success("Processed products.")
 
-    if st.button("🌐 Generate Scrape / Data Snapshot"):
-        out = fn_scraper(WEBSITE, ack_scrape)
-        st.session_state.outputs["scraper"] = out
-
-    st.markdown("---")
-
-    # --- Batch execution ---
-    if st.button("🚀 Execute All Selected"):
-        try:
-            if cb_topic:
-                st.session_state.outputs["topic"] = fn_topic_generator(TOPIC if TOPIC else None)
-
-            if cb_long:
-                st.session_state.outputs["long_form"] = fn_long_form(TOPIC if TOPIC else None)
-
-            if cb_short:
-                st.session_state.outputs["short_form"] = fn_short_form(TOPIC if TOPIC else None)
-
-            if cb_caps:
-                st.session_state.outputs["captions"] = fn_captions(TOPIC if TOPIC else None)
-
-            if cb_prod:
-                st.session_state.outputs["products"] = fn_product_automator(CPD if CPD else None, df_products)
-
-            if cb_leads:
-                st.session_state.outputs["leads"] = fn_leads_processor(BUSINESS_NAME if BUSINESS_NAME else None, df_leads)
-
-            if cb_scrape:
-                st.session_state.outputs["scraper"] = fn_scraper(WEBSITE, ack_scrape)
-
-            st.success("All selected functions executed.")
-        except Exception as e:
-            st.error(f"Batch execution error: {e}")
-            st.code(traceback.format_exc())
-
-# =================================
-# Column 3: Dynamic Output Display
-# =================================
-with col3:
-    st.subheader("📤 Outputs")
-
-    # Topic
-    if "topic" in st.session_state.outputs:
-        st.markdown("#### 1) Niche / Topic Generator")
-        t_out = st.session_state.outputs["topic"]
-        st.code(t_out)
-        if isinstance(t_out, str) and t_out and not t_out.startswith("ERROR"):
-            # Auto-save best effort
-            save_topic_to_file(t_out)
-
-    # Long Form
-    if "long_form" in st.session_state.outputs:
-        st.markdown("#### 2) Ghostwriter — Long Form")
-        st.code(st.session_state.outputs["long_form"])
-
-    # Short Form
-    if "short_form" in st.session_state.outputs:
-        st.markdown("#### 3) Ghostwriter — Short Form")
-        st.code(st.session_state.outputs["short_form"])
-
-    # Captions
-    if "captions" in st.session_state.outputs:
-        st.markdown("#### 4) Social Media Captions")
-        st.code(st.session_state.outputs["captions"])
-
-    # Product Automator
-    if "products" in st.session_state.outputs:
-        st.markdown("#### 5) SEO Product Automator")
-        prod_out = st.session_state.outputs["products"]
+    with out_col:
+        st.markdown("**{ Output } Products**")
+        prod_out = st.session_state.outputs.get("products")
         if isinstance(prod_out, pd.DataFrame):
             st.dataframe(prod_out, use_container_width=True)
             st.caption("Saved to output.csv (if write-permitted).")
+            save_csv_download_button("💾 Download output.csv", prod_out, "output.csv")
+        elif isinstance(prod_out, str):
+            st.code(prod_out)
         else:
-            st.code(str(prod_out))
+            st.info("Run the product automator to see output here.")
 
-    # Leads
-    if "leads" in st.session_state.outputs:
-        st.markdown("#### 6) Lead Processor / Outreach")
-        leads_out = st.session_state.outputs["leads"]
+st.markdown("---")
+
+st.markdown("### 6) Lead Processor / Outreach { Input → Output }")
+with st.container():
+    in_col, out_col = st.columns([1, 1.2], vertical_alignment="top")
+    with in_col:
+        st.markdown("**{ Input } Leads CSV / Business Name**")
+        business_name_input = st.text_input(
+            "Business Name (optional, single-run)",
+            key="business_name_input",
+            placeholder="e.g., 'Acme Outdoors'"
+        )
+        up_leads = st.file_uploader(
+            "Upload leads.csv",
+            type=["csv"],
+            key="upload_leads_per_tool"
+        )
+        df_leads = pd.read_csv(up_leads) if up_leads is not None else None
+
+        if st.button("📧 Generate Outreach Emails", key="btn_leads"):
+            out = fn_leads_processor(
+                business_name_input if business_name_input else None,
+                df_leads
+            )
+            st.session_state.outputs["leads"] = out
+            st.success("Processed leads.")
+
+    with out_col:
+        st.markdown("**{ Output } Leads**")
+        leads_out = st.session_state.outputs.get("leads")
         if isinstance(leads_out, pd.DataFrame):
             st.dataframe(leads_out, use_container_width=True)
             st.caption("Saved to processed_leads.csv (if write-permitted).")
+            save_csv_download_button("💾 Download processed_leads.csv", leads_out, "processed_leads.csv")
+        elif isinstance(leads_out, str):
+            st.code(leads_out)
         else:
-            st.code(str(leads_out))
+            st.info("Run the lead processor to see output here.")
 
-    # Scraper
-    if "scraper" in st.session_state.outputs:
-        st.markdown("#### 7) Ethical Scraper / Data Collector")
-        s_out = st.session_state.outputs["scraper"]
+st.markdown("---")
+
+st.markdown("### 7) Ethical Scraper / Data Collector { Input → Output }")
+with st.container():
+    in_col, out_col = st.columns([1, 1.2], vertical_alignment="top")
+    with in_col:
+        st.markdown("**{ Input } Website URL**")
+        WEBSITE = st.text_input(
+            "WEBSITE (URL to Scrape)",
+            key="website_input",
+            placeholder="https://example.com/trends"
+        )
+        st.warning("Before scraping: **You are responsible** for checking robots.txt and site Terms.")
+        ack_scrape = st.checkbox(
+            "I understand and agree to check robots.txt and Terms.",
+            value=False,
+            key="ack_scrape"
+        )
+
+        if st.button("🌐 Generate Scrape / Data Snapshot", key="btn_scrape"):
+            out = fn_scraper(WEBSITE, ack_scrape)
+            st.session_state.outputs["scraper"] = out
+            st.success("Scraper run completed.")
+
+    with out_col:
+        st.markdown("**{ Output } Scraper Snapshot**")
+        s_out = st.session_state.outputs.get("scraper")
         if isinstance(s_out, dict):
             st.json(s_out)
+        elif isinstance(s_out, str):
+            st.code(s_out)
         else:
-            st.code(str(s_out))
+            st.info("Run the scraper to see output here.")
 
 # ===== Footer =====
 st.markdown("---")
-st.caption("Built for flexible, independent execution. Stay ethical with scraping. 🚦")
-
+st.caption("Each tool has its own {input} → {output} panel. Stay ethical with scraping. 🚦")
